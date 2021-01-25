@@ -1,5 +1,8 @@
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StrictData #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
@@ -30,6 +33,7 @@ module HStream.Processor
 where
 
 import Control.Exception (throw)
+import qualified Control.Exception as E
 import Data.Maybe
 import Data.Typeable
 import HStream.Encoding
@@ -45,6 +49,7 @@ import RIO.HashMap.Partial as HM'
 import qualified RIO.HashSet as HS
 import qualified RIO.List as L
 import qualified RIO.Text as T
+import qualified Prelude as P
 
 -- import qualified Prelude as P
 
@@ -180,15 +185,24 @@ buildInternalSinkProcessor ::
   Processor BL.ByteString BL.ByteString
 buildInternalSinkProcessor producer InternalSinkConfig {..} = Processor $ \Record {..} -> do
   ts <- liftIO getCurrentTimestamp
+  liftIO $ P.print "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+  liftIO $ P.print iSinkTopicName
+  liftIO $
+    do
+      e <- E.try $ P.print recordKey
+      case e of
+        Left (e :: SomeException) -> P.print e
+        Right a -> P.print a
   liftIO $
     send
       producer
       RawProducerRecord
         { rprTopic = iSinkTopicName,
-          rprKey = recordKey,
+          rprKey = Nothing, -- recordKey,
           rprValue = recordValue,
           rprTimestamp = ts
         }
+  liftIO $ P.print "000000000000000000000000000000000000000000000000000000000000000000000000000000"
 
 -- why this not work?
 -- can not deduce k v,
@@ -258,22 +272,11 @@ runTask ::
   Task ->
   IO ()
 runTask TaskConfig {..} task@Task {..} = do
-  topicConsumer <-
-    case tcMessageStoreType of
-      Mock mockStore -> mkMockTopicConsumer mockStore
-      LogDevice -> throwIO $ UnSupportedMessageStoreError "LogDevice is not supported!"
-      Kafka -> throwIO $ UnSupportedMessageStoreError "Kafka is not supported!"
-  topicProducer <-
-    case tcMessageStoreType of
-      Mock mockStore -> mkMockTopicProducer mockStore
-      LogDevice -> throwIO $ UnSupportedMessageStoreError "LogDevice is not supported!"
-      Kafka -> throwIO $ UnSupportedMessageStoreError "Kafka is not supported!"
-
-  -- add InternalSink Node
+  E cs pc <- initFun tcMessageStoreType
   let newTaskTopologyForward =
         HM.foldlWithKey'
           ( \a k v@InternalSinkConfig {..} ->
-              let internalSinkProcessor = buildInternalSinkProcessor topicProducer v
+              let internalSinkProcessor = buildInternalSinkProcessor pc v
                   ep = mkEProcessor internalSinkProcessor
                   (sinkProcessor, children) = taskTopologyForward HM'.! k
                   name = T.append iSinkTopicName "-INTERNAL-SINK"
@@ -286,11 +289,10 @@ runTask TaskConfig {..} task@Task {..} = do
   ctx <- buildTaskContext task {taskTopologyForward = newTaskTopologyForward} tcLogFunc
 
   let sourceTopicNames = HM.keys taskSourceConfig
-  topicConsumer' <- subscribe topicConsumer sourceTopicNames
+  topicConsumer' <- subscribe cs sourceTopicNames
   forever $
     runRIO ctx $ do
-      logDebug "start iteration..."
-      rawRecords <- liftIO $ pollRecords topicConsumer' 2000000
+      rawRecords <- liftIO $ pollRecords topicConsumer' 2000
       logDebug $ "polled " <> display (length rawRecords) <> " records"
       forM_
         rawRecords
@@ -306,10 +308,18 @@ data TaskConfig = TaskConfig
     tcLogFunc :: LogFunc
   }
 
+data E = forall a b. (TopicConsumer a, TopicProducer b) => E a b
+
+initFun :: MessageStoreType -> IO E
+initFun (Mock s) = do
+  a <- mkMockTopicConsumer s
+  b <- mkMockTopicProducer s
+  return $ E a b
+initFun (LogDevice a b) = return $ E a b
+
 data MessageStoreType
   = Mock MockTopicStore
-  | LogDevice
-  | Kafka
+  | forall a b. (TopicConsumer a, TopicProducer b) => LogDevice a b
 
 mkMockTopicStore :: IO MockTopicStore
 mkMockTopicStore = do
